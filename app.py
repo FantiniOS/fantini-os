@@ -10,8 +10,7 @@ from datetime import datetime
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Fantini OS | Enterprise", page_icon="🦁", layout="wide")
 
-# --- ÁREA DE SEGURANÇA (COLE SUAS CHAVES AQUI) ---
-# Deixe assim antes de subir:
+# --- ÁREA DE SEGURANÇA (MANTENHA GENÉRICO PARA O GITHUB) ---
 URL_DO_SUPABASE = "COLE_A_URL_DO_SUPABASE_AQUI" 
 CHAVE_DO_SUPABASE = "COLE_A_KEY_ANON_PUBLIC_AQUI"
 CHAVE_DO_GOOGLE = "COLE_A_CHAVE_AIZA_AQUI"
@@ -21,10 +20,12 @@ CHAVE_DO_GOOGLE = "COLE_A_CHAVE_AIZA_AQUI"
 @st.cache_resource
 def init_supabase():
     try:
-        if "COLE_A" not in URL_DO_SUPABASE:
-            return create_client(URL_DO_SUPABASE, CHAVE_DO_SUPABASE)
+        # Tenta pegar dos secrets do Streamlit Cloud primeiro
         return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     except:
+        # Se falhar (rodando local sem secrets.toml), tenta variáveis
+        if "COLE_A" not in URL_DO_SUPABASE:
+            return create_client(URL_DO_SUPABASE, CHAVE_DO_SUPABASE)
         return None
 
 supabase = init_supabase()
@@ -32,11 +33,14 @@ supabase = init_supabase()
 # --- CONEXÃO IA ---
 def config_gemini():
     try:
-        key = CHAVE_DO_GOOGLE if "COLE_A" not in CHAVE_DO_GOOGLE else st.secrets["GOOGLE_API_KEY"]
+        key = st.secrets["GOOGLE_API_KEY"] # Tenta Cloud
+    except:
+        key = CHAVE_DO_GOOGLE # Tenta Local
+    
+    if key and "COLE_A" not in key:
         genai.configure(api_key=key)
         return True
-    except:
-        return False
+    return False
 
 tem_gemini = config_gemini()
 
@@ -60,14 +64,14 @@ def gerar_pdf_pedido(dados_pedido, catalogo_df):
     pdf.add_page()
     pdf.set_font("Arial", size=12)
     
-    # Cabeçalho do Pedido
+    # Cabeçalho
     pdf.set_font("Arial", 'B', 12)
     pdf.cell(0, 10, f"PEDIDO DE VENDA - {datetime.now().strftime('%d/%m/%Y')}", 0, 1)
     pdf.set_font("Arial", size=12)
     pdf.cell(0, 10, f"Cliente: {dados_pedido.get('cliente', 'Nao Informado')}", 0, 1)
     pdf.ln(5)
     
-    # Cabeçalho da Tabela
+    # Tabela
     pdf.set_fill_color(220, 220, 220)
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(30, 10, "SKU", 1, 0, 'C', 1)
@@ -79,12 +83,10 @@ def gerar_pdf_pedido(dados_pedido, catalogo_df):
     pdf.set_font("Arial", size=10)
     total_geral = 0
     
-    # Loop de Itens Seguro
     for item in dados_pedido.get('itens', []):
         sku = item.get('sku', '')
         qtd = int(item.get('qtd', 1))
         
-        # Busca Preço
         preco_unit = 0.0
         if not catalogo_df.empty:
             filtro = catalogo_df['sku'] == sku
@@ -95,7 +97,6 @@ def gerar_pdf_pedido(dados_pedido, catalogo_df):
         subtotal = preco_unit * qtd
         total_geral += subtotal
         
-        # Desenha Linha
         pdf.cell(30, 10, str(sku)[:15], 1)
         pdf.cell(90, 10, str(item.get('produto', ''))[:40], 1)
         pdf.cell(20, 10, str(qtd), 1, 0, 'C')
@@ -109,38 +110,53 @@ def gerar_pdf_pedido(dados_pedido, catalogo_df):
     
     return pdf.output(dest='S').encode('latin-1')
 
-# --- CÉREBRO DA IA (MODO SEGURO / FALLBACK) ---
-def processar_pedido_gemini(texto_cliente, catalogo_str):
-    prompt = f"""
-    Responda APENAS com JSON.
-    CATÁLOGO: {catalogo_str}
-    PEDIDO: "{texto_cliente}"
-    JSON:
-    {{
-      "cliente": "Nome Identificado",
-      "itens": [ {{ "sku": "...", "produto": "...", "qtd": 1 }} ],
-      "analise": "Resumo"
-    }}
-    """
-    
+# --- CÉREBRO DA IA (AUTO-DETECÇÃO DE MODELO) ---
+def encontrar_modelo_disponivel():
+    """Varre a conta e acha um modelo que funciona"""
+    modelos_candidatos = []
     try:
-        # TENTATIVA 1: Modelo Flash (Mais Rápido)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
-    except Exception:
-        try:
-            # TENTATIVA 2: Modelo Pro (Mais Estável - Fallback)
-            print("⚠️ Flash falhou, trocando para Gemini Pro...")
-            model = genai.GenerativeModel('gemini-pro')
-            response = model.generate_content(prompt)
-        except Exception as e:
-            return {"erro": f"Todos os modelos falharam: {str(e)}"}
-
-    try:
-        texto_limpo = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(texto_limpo)
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                modelos_candidatos.append(m.name)
+                # Se achar o Flash ou Pro 1.5, já retorna (são os melhores)
+                if 'flash' in m.name or '1.5' in m.name:
+                    return m.name
+        
+        # Se não achou preferido, pega o primeiro da lista
+        if modelos_candidatos:
+            return modelos_candidatos[0]
     except:
-        return {"erro": "Erro ao ler JSON da IA", "bruto": response.text}
+        pass
+    return 'gemini-pro' # Último recurso
+
+def processar_pedido_gemini(texto_cliente, catalogo_str):
+    try:
+        nome_modelo = encontrar_modelo_disponivel()
+        # print(f"Usando modelo: {nome_modelo}") # Debug silencioso
+        
+        model = genai.GenerativeModel(nome_modelo)
+        
+        prompt = f"""
+        Responda APENAS com JSON.
+        CATÁLOGO: {catalogo_str}
+        PEDIDO: "{texto_cliente}"
+        JSON:
+        {{
+          "cliente": "Nome Identificado",
+          "itens": [ {{ "sku": "...", "produto": "...", "qtd": 1 }} ],
+          "analise": "Resumo"
+        }}
+        """
+        response = model.generate_content(prompt)
+        texto_limpo = response.text.replace("```json", "").replace("```", "").strip()
+        
+        try:
+            return json.loads(texto_limpo)
+        except:
+            return {"erro": "IA respondeu mas falhou no JSON", "bruto": texto_limpo}
+
+    except Exception as e:
+        return {"erro": f"Erro Técnico ({nome_modelo}): {str(e)}"}
 
 # --- MENU ---
 with st.sidebar:
@@ -151,7 +167,6 @@ with st.sidebar:
     st.success(f"Sistema Online")
 
 # --- PÁGINAS ---
-
 if menu == "Dashboard":
     st.header("📊 Visão Executiva")
     if supabase:
@@ -162,7 +177,7 @@ if menu == "Dashboard":
             c2.metric("Total SKUs", len(df))
             st.plotly_chart(px.bar(df, x='nome', y='estoque_atual', title="Estoque"))
         else:
-            st.warning("Cadastre produtos na aba 'Produtos'.")
+            st.warning("Sem dados.")
 
 elif menu == "Produtos":
     st.header("📦 Gestão de Catálogo")
@@ -178,10 +193,7 @@ elif menu == "Produtos":
             preco = st.number_input("Preço", min_value=0.0)
             estoque = st.number_input("Estoque", min_value=0)
             if st.form_submit_button("Salvar"):
-                supabase.table('produtos').insert({
-                    "sku": sku, "nome": nome, 
-                    "preco_tabela": preco, "estoque_atual": estoque
-                }).execute()
+                supabase.table('produtos').insert({"sku": sku, "nome": nome, "preco_tabela": preco, "estoque_atual": estoque}).execute()
                 st.rerun()
 
 elif menu == "Clientes":
@@ -196,11 +208,7 @@ elif menu == "Clientes":
             razao = st.text_input("Nome")
             zap = st.text_input("WhatsApp")
             if st.form_submit_button("Salvar"):
-                supabase.table('clientes').insert({
-                    "razao_social": razao, 
-                    "whatsapp_comprador": zap, 
-                    "cnpj": "ISENTO"
-                }).execute()
+                supabase.table('clientes').insert({"razao_social": razao, "whatsapp_comprador": zap, "cnpj": "ISENTO"}).execute()
                 st.rerun()
 
 elif menu == "Agente de Vendas":
@@ -228,3 +236,5 @@ elif menu == "Agente de Vendas":
                             st.download_button("📄 BAIXAR PDF", pdf_bytes, "Pedido.pdf", "application/pdf", type="primary")
                         except Exception as e:
                             st.error(f"Erro PDF: {e}")
+        elif btn:
+            st.error("Erro de configuração de chaves.")
